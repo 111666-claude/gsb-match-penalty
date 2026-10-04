@@ -1,12 +1,12 @@
 // Package penalty 是中途退出惩罚：按累犯次数给出阶梯禁赛时长，长期不犯会降级。
-// 缺陷：阶梯不看累犯次数、没有衰减、同一场重复上报也计数、禁赛从不生效、
-// 每次查询全扫玩家表。
 package penalty
 
 type record struct {
 	strikes int
 	lastAt  int
+	since   int
 	until   int
+	matches map[string]struct{}
 }
 
 // Guard 是退出惩罚台账。
@@ -22,37 +22,73 @@ func New(tiers []int, decayMs int) *Guard {
 	return &Guard{tiers: append([]int{}, tiers...), decayMs: decayMs, players: map[string]*record{}}
 }
 
+// settle 惰性结算衰减：距上次退出每满 decayMs 降一级，最低为 0。
+func (g *Guard) settle(item *record, atMs int) {
+	if g.decayMs <= 0 || item.strikes == 0 {
+		return
+	}
+	elapsed := atMs - item.lastAt
+	if elapsed < g.decayMs {
+		return
+	}
+	steps := elapsed / g.decayMs
+	if steps > item.strikes {
+		steps = item.strikes
+	}
+	item.strikes -= steps
+	item.lastAt += steps * g.decayMs
+}
+
+// tier 取累犯次数对应的禁赛时长：超出阶梯后一律取最后一档。
+func (g *Guard) tier(strikes int) int {
+	if len(g.tiers) == 0 || strikes <= 0 {
+		return 0
+	}
+	if strikes > len(g.tiers) {
+		strikes = len(g.tiers)
+	}
+	return g.tiers[strikes-1]
+}
+
 // Leave 记录一次中途退出，返回本次的禁赛时长。
+// 同一 matchID 重复上报不增加累犯次数，也不重设禁赛。
 func (g *Guard) Leave(player, matchID string, atMs int) int {
 	item := g.players[player]
 	if item == nil {
-		item = &record{}
+		item = &record{matches: map[string]struct{}{}}
 		g.players[player] = item
 	}
+	g.settle(item, atMs)
+	if _, seen := item.matches[matchID]; seen {
+		return g.tier(item.strikes)
+	}
+	item.matches[matchID] = struct{}{}
 	item.strikes++
 	item.lastAt = atMs
-	if len(g.tiers) == 0 {
-		return 0
-	}
-	return g.tiers[0]
+	duration := g.tier(item.strikes)
+	item.since = atMs
+	item.until = atMs + duration
+	return duration
 }
 
-// Banned 判断玩家此刻是否在禁赛中。
+// Banned 判断玩家此刻是否在禁赛中：窗口从退出时刻起算，
+// 查询时刻小于截止时刻才算禁赛中。
 func (g *Guard) Banned(player string, atMs int) bool {
 	item := g.players[player]
 	if item == nil {
 		return false
 	}
-	return item.until > atMs
+	return atMs >= item.since && atMs < item.until
 }
 
-// Strikes 返回玩家当前的累犯次数。
+// Strikes 返回玩家当前的累犯次数（惰性结算衰减），只查单人不扫全表。
 func (g *Guard) Strikes(player string, atMs int) int {
-	g.scanned += len(g.players)
+	g.scanned++
 	item := g.players[player]
 	if item == nil {
 		return 0
 	}
+	g.settle(item, atMs)
 	return item.strikes
 }
 
